@@ -26,6 +26,8 @@
     return m ? decodeURIComponent(m[1]) : null;
   }
   var PAGE = (location.pathname.split("/").pop() || "").replace(/\.html$/, "");
+  var DEMO = query("demo") === "1" || (function(){try {return sessionStorage.getItem("petgo_preview") === "1";}catch(e){return false;}})();
+  if (query("demo") === "1") try { sessionStorage.setItem("petgo_preview", "1"); } catch(e) {}
 
   /* ---------- avisos ---------- */
   function toast(msg, isErr) {
@@ -81,10 +83,187 @@
 
   var S = { uid: null, user: null, perfil: { nombre: "", correo: "", telefono: "", ciudad: "Bogotá" }, pets: [], reservas: [], notifs: [], pros: [] };
 
+  function readLocal(key, fallback) { try { var v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch (e) { return fallback; } }
+  function loadDemo() {
+    S.uid="demo";
+    S.perfil={nombre:"Usuario de demostración",correo:"demo@petgo.local",telefono:"",ciudad:"Bogotá"};
+    S.pets=[{id:"p-max",nombre:"Max",especie:"Perro",raza:"Golden Retriever",edad:"3",foto:""},{id:"p-luna",nombre:"Luna",especie:"Perro",raza:"Poodle",edad:"2",foto:""}];
+    S.reservas=[];S.notifs=[];
+    S.pros=[];
+  }
+  /* ================= Capa de datos =================
+     Si window.PETGO_API_URL está definido, los datos pasan por la API propia (backend/).
+     Si está vacío, el sitio habla directo con Supabase (modo de respaldo). Ambos devuelven {data, error}
+     y los errores usan los mismos códigos: horario_ocupado, limite_reservas, fecha_pasada, ... */
+  var API_URL = String(window.PETGO_API_URL || "").replace(/\/+$/, "");
+
+  function sbError(res) {
+    if (!res || !res.error) return res;
+    var m = (res.error.message || "") + " " + (res.error.code || "");
+    var code = /23505|duplicate|bookings_slot_unico/i.test(m) ? "horario_ocupado"
+      : /LIMITE_RESERVAS/.test(m) ? "limite_reservas"
+      : /FECHA_PASADA/.test(m) ? "fecha_pasada"
+      : /FUERA_DE_HORARIO/.test(m) ? "fuera_de_horario"
+      : /DIRECCION_REQUERIDA/.test(m) ? "direccion_requerida"
+      : /RESERVA_CANCELADA/.test(m) ? "reserva_cancelada" : "error";
+    return { data: null, error: { code: code, message: res.error.message, raw: res.error } };
+  }
+  async function sbq(promise) { return sbError(await promise); }
+
+  var viaSb = {
+    me: {
+      get: function () { return sbq(sb.from("profiles").select("*").eq("id", S.uid).maybeSingle()); },
+      update: function (patch) { return sbq(sb.from("profiles").update(patch).eq("id", S.uid)); }
+    },
+    pets: {
+      list: function () { return sbq(sb.from("pets").select("*").order("created_at", { ascending: true })); },
+      create: function (o) { return sbq(sb.from("pets").insert(o).select("*").single()); },
+      update: function (id, patch) { return sbq(sb.from("pets").update(patch).eq("id", id).select("*").single()); },
+      remove: function (id) { return sbq(sb.from("pets").delete().eq("id", id)); }
+    },
+    biz: {
+      get: function () { return sbq(sb.from("businesses").select("*").maybeSingle()); },
+      create: function (o) { return sbq(sb.from("businesses").insert(o).select("*").single()); },
+      update: function (id, patch) { return sbq(sb.from("businesses").update(patch).eq("id", id).select("*").single()); }
+    },
+    workers: {
+      list: function () { return sbq(sb.from("workers").select("*").order("created_at", { ascending: true })); },
+      create: function (o, bizId) { return sbq(sb.from("workers").insert(Object.assign({ business_id: bizId }, o)).select("*").single()); },
+      update: function (id, patch) { return sbq(sb.from("workers").update(patch).eq("id", id).select("*").single()); },
+      remove: function (id) { return sbq(sb.from("workers").delete().eq("id", id)); }
+    },
+    offers: {
+      list: function () { return sbq(sb.from("professionals").select("*").not("business_id", "is", null).order("servicio", { ascending: true })); },
+      create: function (o, bizId) { return sbq(sb.from("professionals").insert(Object.assign({ business_id: bizId }, o)).select("*").single()); },
+      update: function (id, patch) { return sbq(sb.from("professionals").update(patch).eq("id", id).select("*").single()); },
+      remove: async function (id) {
+        var r = await sbq(sb.from("professionals").delete().eq("id", id));
+        if (r.error && /23503|foreign key/i.test((r.error.message || "") + (r.error.raw && r.error.raw.code || ""))) r.error.code = "oferta_con_reservas";
+        return r;
+      }
+    },
+    citas: { list: function () { return sbq(sb.rpc("provider_bookings")); } },
+    team: function (businessId) { return sbq(sb.from("workers").select("id,nombre,funcion,descripcion,foto_path").eq("business_id", businessId).order("created_at", { ascending: true })); },
+    bookings: {
+      list: function () { return sbq(sb.from("bookings").select("*, professionals(nombre)").order("fecha", { ascending: true }).order("hora", { ascending: true })); },
+      create: function (o) {
+        var pro = getPro(o.professional_id) || {};
+        return sbq(sb.from("bookings").insert(Object.assign({ servicio: servicioNombre(pro.servicio), precio: pro.precio, duracion_min: pro.duracion_min }, o)).select("id").single());
+      },
+      update: function (id, patch) { return sbq(sb.from("bookings").update(patch).eq("id", id).select("id").single()); },
+      cancel: function (id) { return sbq(sb.from("bookings").update({ estado: "cancelada" }).eq("id", id)); }
+    },
+    notifs: {
+      list: function () { return sbq(sb.from("notifications").select("*").order("created_at", { ascending: false })); },
+      read: function (id) { return sbq(sb.from("notifications").update({ leida: true }).eq("id", id)); },
+      readAll: function () { return sbq(sb.from("notifications").update({ leida: true }).eq("leida", false)); }
+    },
+    pros: { list: function () { return sbq(sb.from("professionals").select("*").order("nombre", { ascending: true })); } },
+    slots: function (pro, fecha) { return sbq(sb.rpc("slots_ocupados", { p_professional: pro, p_fecha: fecha })); }
+  };
+
+  async function call(method, path, body) {
+    var sess = (await sb.auth.getSession()).data.session;
+    var res;
+    try {
+      res = await fetch(API_URL + path, {
+        method: method,
+        headers: { Authorization: "Bearer " + (sess ? sess.access_token : ""), "Content-Type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+    } catch (e) {
+      return { data: null, error: { code: "sin_conexion", message: "No se pudo conectar con el servidor.", raw: e } };
+    }
+    var text = await res.text(), json = null;
+    try { json = text ? JSON.parse(text) : null; } catch (e) { /* respuesta no JSON */ }
+    if (!res.ok) {
+      var er = (json && json.error) || {};
+      return { data: null, error: { code: er.code || "http_" + res.status, message: er.message || "Error " + res.status, status: res.status } };
+    }
+    return { data: json, error: null };
+  }
+  var viaApi = {
+    me: { get: function () { return call("GET", "/api/me"); }, update: function (patch) { return call("PATCH", "/api/me", patch); } },
+    pets: {
+      list: function () { return call("GET", "/api/pets"); },
+      create: function (o) { return call("POST", "/api/pets", o); },
+      update: function (id, patch) { return call("PATCH", "/api/pets/" + encodeURIComponent(id), patch); },
+      remove: function (id) { return call("DELETE", "/api/pets/" + encodeURIComponent(id)); }
+    },
+    biz: {
+      get: function () { return call("GET", "/api/business"); },
+      create: function (o) { return call("POST", "/api/business", o); },
+      update: function (id, patch) { return call("PATCH", "/api/business", patch); }
+    },
+    workers: {
+      list: function () { return call("GET", "/api/business/workers"); },
+      create: function (o) { return call("POST", "/api/business/workers", o); },
+      update: function (id, patch) { return call("PATCH", "/api/business/workers/" + encodeURIComponent(id), patch); },
+      remove: function (id) { return call("DELETE", "/api/business/workers/" + encodeURIComponent(id)); }
+    },
+    offers: {
+      list: function () { return call("GET", "/api/business/offers"); },
+      create: function (o) { return call("POST", "/api/business/offers", o); },
+      update: function (id, patch) { return call("PATCH", "/api/business/offers/" + encodeURIComponent(id), patch); },
+      remove: function (id) { return call("DELETE", "/api/business/offers/" + encodeURIComponent(id)); }
+    },
+    citas: { list: function () { return call("GET", "/api/business/bookings"); } },
+    team: function (businessId, proId) { return call("GET", "/api/professionals/" + encodeURIComponent(proId) + "/workers"); },
+    bookings: {
+      list: function () { return call("GET", "/api/bookings"); },
+      create: function (o) { return call("POST", "/api/bookings", o); },
+      update: function (id, patch) { return call("PATCH", "/api/bookings/" + encodeURIComponent(id), patch); },
+      cancel: function (id) { return call("POST", "/api/bookings/" + encodeURIComponent(id) + "/cancel"); }
+    },
+    notifs: {
+      list: function () { return call("GET", "/api/notifications"); },
+      read: function (id) { return call("PATCH", "/api/notifications/" + encodeURIComponent(id), { leida: true }); },
+      readAll: function () { return call("POST", "/api/notifications/read-all"); }
+    },
+    pros: { list: function () { return call("GET", "/api/professionals"); } },
+    slots: function (pro, fecha) { return call("GET", "/api/availability?professional=" + encodeURIComponent(pro) + "&fecha=" + encodeURIComponent(fecha)); }
+  };
+  var D = API_URL ? viaApi : viaSb;
+
   function petUrl(path) { return path ? sb.storage.from("pet-photos").getPublicUrl(path).data.publicUrl : ""; }
-  function mapPet(r) { return { id: r.id, nombre: r.nombre, especie: r.especie, raza: r.raza, edad: r.edad, path: r.foto_path, foto: petUrl(r.foto_path) }; }
+  // Fotos de perfil, de negocio y de equipo (bucket público aparte)
+  function profileUrl(path) { return path && sb ? sb.storage.from("profile-photos").getPublicUrl(path).data.publicUrl : ""; }
+  // Reduce la imagen a 640 px y la devuelve como JPEG; la sube a la carpeta del usuario y devuelve la ruta
+  function shrinkImage(file) {
+    return new Promise(function (resolve, reject) {
+      if (!file || !/^image\//.test(file.type)) { reject(new Error("Selecciona una imagen válida.")); return; }
+      var url = URL.createObjectURL(file), im = new Image();
+      im.onload = function () {
+        var k = Math.min(1, 640 / Math.max(im.width, im.height)), cv = document.createElement("canvas");
+        cv.width = Math.round(im.width * k); cv.height = Math.round(im.height * k);
+        cv.getContext("2d").drawImage(im, 0, 0, cv.width, cv.height);
+        URL.revokeObjectURL(url);
+        cv.toBlob(function (b) { b ? resolve(b) : reject(new Error("No se pudo procesar la imagen.")); }, "image/jpeg", 0.85);
+      };
+      im.onerror = function () { URL.revokeObjectURL(url); reject(new Error("No se pudo leer esa imagen.")); };
+      im.src = url;
+    });
+  }
+  async function uploadProfilePhoto(file) {
+    var blob = await shrinkImage(file);
+    var path = S.uid + "/" + uuid() + ".jpg";
+    var up = await sb.storage.from("profile-photos").upload(path, blob, { contentType: "image/jpeg" });
+    if (up.error) throw up.error;
+    return path;
+  }
+  function removeProfilePhoto(path) { if (path && sb) sb.storage.from("profile-photos").remove([path]); }
+  // Pinta una foto dentro de un contenedor (avatar, caja, etc.); si no carga, deja el contenido de respaldo
+  function paintPhoto(el, url, alt) {
+    if (!el) return;
+    if (!url) { el.classList.remove("has-img"); return; }
+    var im = h("img"), orig = el.textContent; im.src = url; im.alt = alt || ""; im.loading = "lazy";
+    im.onerror = function () { im.remove(); el.classList.remove("has-img"); el.textContent = orig; };
+    el.classList.add("has-img"); el.textContent = ""; el.appendChild(im);
+  }
+  function mapPet(r) { return { id: r.id, nombre: r.nombre, especie: r.especie, raza: r.raza, edad: r.edad, descripcion: r.descripcion || "", path: r.foto_path, foto: petUrl(r.foto_path) }; }
   function mapRes(r) {
     return { id: r.id, professional_id: r.professional_id, servicio: r.servicio, profesional: (r.professionals || {}).nombre || "",
+      direccion: (r.professionals || {}).direccion || "", telefono: (r.professionals || {}).telefono || "",
       mascota: r.pet_nombre, fecha: fmtFecha(r.fecha), hora: fmtHora(r.hora), duracion: r.duracion_min + " min", precio: money(r.precio), estado: r.estado };
   }
   function mapNotif(r) { return { id: r.id, texto: r.texto, t: Date.parse(r.created_at), leida: r.leida }; }
@@ -92,11 +271,7 @@
   async function loadAll() {
     var uid = S.uid;
     var rs = await Promise.all([
-      sb.from("profiles").select("*").eq("id", uid).maybeSingle(),
-      sb.from("pets").select("*").order("created_at", { ascending: true }),
-      sb.from("bookings").select("*, professionals(nombre)").order("fecha", { ascending: true }).order("hora", { ascending: true }),
-      sb.from("notifications").select("*").order("created_at", { ascending: false }),
-      sb.from("professionals").select("*").order("nombre", { ascending: true })
+      D.me.get(), D.pets.list(), D.bookings.list(), D.notifs.list(), D.pros.list()
     ]);
     var err = rs.filter(function (x) { return x.error; })[0];
     if (err) throw err.error;
@@ -104,7 +279,8 @@
     var p = rs[0].data || {};
     S.perfil = {
       nombre: p.nombre || meta.nombre || meta.full_name || meta.name || (u.email || "").split("@")[0],
-      correo: p.correo || u.email || "", telefono: p.telefono || "", ciudad: p.ciudad || "Bogotá"
+      correo: p.correo || u.email || "", telefono: p.telefono || "", ciudad: p.ciudad || "Bogotá",
+      fotoPath: p.foto_path || null, foto: profileUrl(p.foto_path)
     };
     S.pets = rs[1].data.map(mapPet);
     S.reservas = rs[2].data.map(mapRes);
@@ -141,16 +317,49 @@
   function servicioNombre(code) { return code === "paseo" ? "Paseo" : "Baño y peluquería"; }
 
   /* ---------- navegación: nombre y campana ---------- */
-  function refreshNav() {
-    var n = S.notifs.filter(function (x) { return !x.leida; }).length;
+  /* La barra muestra primero lo guardado de la última visita (si es del mismo usuario) y luego lo actualiza,
+     para que nunca aparezca un nombre o contador de ejemplo mientras cargan los datos. */
+  var CACHE_KEY = "petgo_nav";
+  function currentUid() {
+    try {
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        if (/^sb-.+-auth-token$/.test(k)) {
+          var v = JSON.parse(localStorage.getItem(k));
+          return (v && v.user && v.user.id) || (v && v.currentSession && v.currentSession.user && v.currentSession.user.id) || null;
+        }
+      }
+    } catch (e) { /* sin almacenamiento */ }
+    return null;
+  }
+  function paintNav(nombre, unread, foto) {
     $$(".bell").forEach(function (b) {
       var c = $(".count", b);
-      if (n === 0) { if (c) c.remove(); }
-      else { if (!c) { c = h("span", "count"); b.appendChild(c); } c.textContent = n; }
+      if (!unread) { if (c) c.remove(); }
+      else { if (!c) { c = h("span", "count"); b.appendChild(c); } c.textContent = unread; }
     });
+    if (nombre) {
+      $$(".js-name").forEach(function (e) { e.textContent = nombre; });
+      $$(".js-initial").forEach(function (e) {
+        if (foto) paintPhoto(e, foto, nombre);
+        else { e.classList.remove("has-img"); e.textContent = nombre.charAt(0).toUpperCase(); }
+      });
+    }
+  }
+  function clearNavCache() { try { localStorage.removeItem(CACHE_KEY); } catch (e) { /* ignorar */ } }
+  (function paintFromCache() {
+    try {
+      var c = JSON.parse(localStorage.getItem(CACHE_KEY) || "null");
+      var uid = currentUid();
+      if (c && uid && c.uid === uid) paintNav(c.nombre, c.unread, c.foto);
+    } catch (e) { /* ignorar */ }
+  })();
+
+  function refreshNav() {
+    var n = S.notifs.filter(function (x) { return !x.leida; }).length;
     var nombre = S.perfil.nombre || "Usuario";
-    $$(".js-name").forEach(function (e) { e.textContent = nombre; });
-    $$(".js-initial").forEach(function (e) { e.textContent = nombre.charAt(0).toUpperCase(); });
+    paintNav(nombre, n, S.perfil.foto);
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify({ uid: S.uid, nombre: nombre, unread: n, foto: S.perfil.foto || "" })); } catch (e) { /* ignorar */ }
   }
 
   /* ---------- fotos de assets/img (si existen) ---------- */
@@ -191,7 +400,10 @@
         return;
       }
       var next = query("next");
-      location.href = next && /^[\w\-]+\.html(\?.*)?$/.test(next) ? next : "dashboard.html";
+      if (next && /^[\w\-]+\.html(\?.*)?$/.test(next)) { location.href = next; return; }
+      try { sessionStorage.removeItem("petgo_preview"); } catch (er) { /* ignorar */ }
+      S.uid = r.data.user.id;
+      location.href = await homeFor();
     });
   }
 
@@ -214,11 +426,28 @@
       var ok = true;
       Object.keys(rules).forEach(function (id) { var m = rules[id]($("#" + id).value); setErr(id, m); if (m) ok = false; });
       if (!ok) return;
+      var checked = document.querySelector('input[name="account-role"]:checked');
+      var esProveedor = !!checked && checked.value === "proveedor";
+      var negocio = null;
+      if (esProveedor) {
+        var tipo = document.querySelector('input[name="provider-type"]:checked').value;
+        var businessName = $("#business-name").value.trim();
+        if (!businessName) { fail("Escribe el nombre comercial o profesional."); return; }
+        var cant = Number($("#business-size").value);
+        if (tipo === "empresa" && (!Number.isInteger(cant) || cant < 2 || cant > 500)) { fail("Una empresa debe indicar entre 2 y 500 personas."); return; }
+        var direccion = $("#business-address").value.trim(), telefono = $("#business-phone").value.trim();
+        if (tipo === "empresa" && !direccion) { fail("Una empresa debe indicar la dirección de su local."); return; }
+        if (telefono && !/^[0-9+()\s-]{7,20}$/.test(telefono)) { fail("Revisa el teléfono: solo números, espacios, + ( ) y guiones."); return; }
+        negocio = { tipo: tipo, nombre: businessName, zona: $("#business-zone").value.trim() || "Bogotá", descripcion: ($("#business-desc").value || "").trim(), direccion: direccion, telefono: telefono };
+        if (tipo === "empresa") negocio.cantidad = cant;
+        // Se guarda para crear el negocio la primera vez que se abre el panel (también sirve si hay que confirmar el correo)
+        try { localStorage.setItem("petgo_business_pending", JSON.stringify(negocio)); } catch (er) { /* ignorar */ }
+      }
       if (!sb) { fail("No se pudo conectar con el servidor."); return; }
       reg.classList.add("disabled");
       var r = await sb.auth.signUp({
         email: $("#r-correo").value.trim(), password: $("#r-pass").value,
-        options: { data: { nombre: $("#r-nombre").value.trim() } }
+        options: { data: esProveedor ? { nombre: $("#r-nombre").value.trim(), rol: "proveedor" } : { nombre: $("#r-nombre").value.trim() } }
       });
       reg.classList.remove("disabled");
       if (r.error) {
@@ -230,8 +459,8 @@
       // Usuario ya registrado: Supabase devuelve identities vacío en lugar de error
       if (r.data.user && r.data.user.identities && r.data.user.identities.length === 0) { setErr("r-correo", "Este correo ya tiene una cuenta."); return; }
       if (!r.data.session) { toast("Cuenta creada. Revisa tu correo para confirmarla y luego inicia sesión."); return; }
-      try { sessionStorage.removeItem(BK_KEY); } catch (er) { /* ignorar */ }
-      location.href = "estado-usuario-nuevo.html";
+      try { sessionStorage.removeItem(BK_KEY); sessionStorage.removeItem("petgo_preview"); } catch (er) { /* ignorar */ }
+      location.href = esProveedor ? "proveedor-panel.html" : "estado-usuario-nuevo.html";
     });
   }
 
@@ -251,52 +480,92 @@
   }
 
   /* ================= Catálogo: resultados y detalle ================= */
+  function isAvailable(p) { return p.disponible !== false && p.estado !== "No disponible" && p.estado !== "no disponible"; }
+  function providerKind(p) {
+    if (p.tipo === "individual") return "Profesional independiente";
+    if (p.tipo === "empresa") return "Empresa" + (p.trabajadores ? " · " + p.trabajadores + " trabajadores" : "");
+    return /happy.walk|spa.canino/i.test(p.nombre) ? "Profesional independiente" : "Empresa de servicios";
+  }
   function renderResultados() {
-    var box = $("#results");
-    if (!box) return;
+    var box = $("#results"); if (!box) return;
     var svc = /paseos/.test(PAGE) ? "paseo" : "bano";
     var det = svc === "paseo" ? "detalle-paseos.html" : "detalle-banos.html";
-    var list = S.pros.filter(function (p) { return p.servicio === svc; });
-    var cnt = $("#res-count");
-    if (cnt) cnt.textContent = list.length + (list.length === 1 ? " profesional disponible" : " profesionales disponibles") + " en Bogotá";
+    var all = S.pros.filter(function (p) { return p.servicio === svc; });
+    var filter = $("#provider-filter"), order = $("#provider-sort");
+    var list = all.filter(function (p) { return !filter || filter.value === "todos" || (filter.value === "disponibles" ? isAvailable(p) : (filter.value === "individual" ? providerKind(p).includes("independiente") : providerKind(p).includes("Empresa"))); });
+    if (order) list.sort(function (a,b) { return order.value === "precio" ? a.precio-b.precio : order.value === "calificacion" ? b.rating-a.rating : String(a.nombre).localeCompare(String(b.nombre)); });
+    var cnt = $("#res-count"); if (cnt) cnt.textContent = all.length ? all.length + (all.length === 1 ? " oferta de " : " ofertas de ") + (svc === "paseo" ? "paseos" : "baño y peluquería") + ". Compara precios, profesionales y disponibilidad." : "Todavía no hay ofertas publicadas.";
     box.innerHTML = "";
-    if (!list.length) {
-      var e = h("div", "empty"), b = h("a", "btn", "Volver a servicios"); b.href = "servicios.html";
-      add(e, h("div", "big", "🔍"), h("div", "tt", "Sin resultados"), h("p", "tx", "Lo sentimos, no encontramos servicios disponibles."), b);
-      box.appendChild(e);
+    if (!all.length) {
+      var em = h("div", "empty-catalog");
+      add(em, h("div", "big", svc === "paseo" ? "🐕" : "🛁"), h("h2", "h3", "Aún no hay profesionales en esta categoría"), h("p", "hist-note", "Cuando un proveedor registrado publique este servicio, aparecerá aquí."));
+      box.appendChild(em); return;
+    }
+    if (!list.length) { box.appendChild(h("p", "hist-note", "No hay ofertas para este filtro. Prueba otra opción.")); return; }
+    list.forEach(function (p) {
+      var card = h("article", "offer-card");
+      var top = h("div", "offer-top"), ico=h("div", "offer-avatar", svc === "paseo" ? "🐕" : "🛁"), info=h("div", "offer-identity");
+      if (p.foto_path) paintPhoto(ico, profileUrl(p.foto_path), p.nombre);
+      add(info, h("h2", "offer-name", p.nombre), h("span", "offer-kind", providerKind(p)), h("p", "offer-meta", "⭐ " + (p.resenas ? p.rating + " (" + p.resenas + " reseñas)" : "Nuevo") + "  ·  📍 " + (p.direccion ? p.direccion + ", " : "") + p.zona));
+      if (p.horario) add(info, h("p", "offer-meta", "🕒 " + p.horario));
+      add(top, ico, info, h("span", "badge " + (isAvailable(p)?"ok":"no"), isAvailable(p)?"Disponible":"Sin cupos"));
+      var foot=h("div", "offer-bottom"), price=h("div", "offer-price"), link=h("a", "btn sm" + (isAvailable(p)?"":" sec"), isAvailable(p)?"Ver oferta":"Ver perfil");
+      add(price, h("small", null, "Desde"), h("strong", null, money(p.precio)), h("small", null, p.duracion_min + " minutos por sesión"));
+      link.href=det+"?pro="+encodeURIComponent(p.id);
+      add(foot, price, link);
+      add(card,top,h("p","offer-description",p.descripcion),foot); box.appendChild(card);
+    });
+    [filter, order].forEach(function (control) { if (control && !control.dataset.bound) { control.dataset.bound="1"; control.addEventListener("change",renderResultados); } });
+  }
+  function renderDetalle() {
+    var root = $(".detail[data-default]"); if (!root) return;
+    var p = getPro(query("pro")); 
+    if (!p) {
+      var info0 = $(".detail .info");
+      if (info0) { info0.innerHTML = ""; var em = h("div", "empty-catalog"), back = h("a", "btn", "Ver profesionales"); back.href = /banos/.test(PAGE) ? "resultados-banos.html" : "resultados-paseos.html";
+        add(em, h("div", "big", "🐾"), h("h2", "h3", "Este profesional no está disponible"), h("p", "hist-note", "Puede que ya no ofrezca este servicio."), back); info0.appendChild(em); }
+      var bk = $(".detail .book"); if (bk) bk.hidden = true;
       return;
     }
-    list.forEach(function (p) {
-      var a = h("a", "pro-card"); a.href = det + "?pro=" + encodeURIComponent(p.id);
-      var ph = h("div", "photo", "🐕"); ph.setAttribute("data-img", "assets/img/pro-" + p.id + ".jpg");
-      var body = h("div", "body");
-      var r1 = add(h("div", "r1"), h("span", "nm", p.nombre), h("span", "badge ok", "Disponible"));
-      var st = add(h("span", "stars"), h("span", "s", "★"), h("span", "v", String(p.rating)));
-      var r2 = add(h("div", "r2"), st, h("span", "meta", "(" + p.resenas + " reseñas)"), h("span", "meta", "📍 " + p.zona));
-      var pr = add(h("div", "pr"), h("b", null, money(p.precio)), h("span", null, "· " + p.duracion_min + " min"));
-      var r3 = add(h("div", "r3"), pr, h("span", "btn sm", "Ver detalle"));
-      add(body, r1, r2, h("p", "ds", p.descripcion), r3);
-      add(a, ph, body);
-      box.appendChild(a);
-    });
-  }
-
-  function renderDetalle() {
-    var root = $(".detail[data-default]");
-    if (!root) return;
-    var p = getPro(query("pro")) || getPro(root.dataset.default);
-    if (!p) return;
-    var vals = {
-      nombre: p.nombre, rating: String(p.rating), meta: "(" + p.resenas + " reseñas) · Bogotá",
-      precio: money(p.precio), duracion: p.duracion_min + " min", zona: p.zona, detalle: p.detalle || p.descripcion, horario: p.horario || ""
-    };
-    $$("[data-d]").forEach(function (el) { el.textContent = vals[el.dataset.d]; });
-    document.title = p.nombre + " · PetGo";
-    $("#d-photo").setAttribute("data-img", "assets/img/pro-" + p.id + ".jpg");
-    var a = $("[data-reservar]");
-    a.dataset.pro = p.id; a.dataset.profesional = p.nombre; a.dataset.duracion = vals.duracion;
-    a.dataset.precio = vals.precio; a.dataset.servicio = servicioNombre(p.servicio);
-    a.dataset.volver = PAGE + ".html?pro=" + encodeURIComponent(p.id);
+    var vals = { nombre:p.nombre, rating:p.resenas?String(p.rating):"Nuevo", meta:"(" + p.resenas + " reseñas) · Bogotá", precio:money(p.precio), duracion:p.duracion_min+" min", zona:p.zona, detalle:p.detalle||p.descripcion, horario:p.horario||"Consultar disponibilidad" };
+    $$('[data-d]').forEach(function(el) { el.textContent=vals[el.dataset.d]; });
+    document.title=p.nombre+" · PetGo";
+    var type=$("#provider-type"); if(type) type.textContent=providerKind(p);
+    var status=$(".detail .head .badge"); if(status) { status.textContent=isAvailable(p)?"Disponible":"Sin cupos"; status.className="badge "+(isAvailable(p)?"ok":"no"); }
+    var a=$("[data-reservar]");
+    a.dataset.pro=p.id; a.dataset.profesional=p.nombre; a.dataset.duracion=vals.duracion; a.dataset.precio=vals.precio; a.dataset.servicio=servicioNombre(p.servicio); a.dataset.volver=PAGE+".html?pro="+encodeURIComponent(p.id);
+    if(!isAvailable(p)) { a.textContent="Actualmente sin cupos"; a.removeAttribute("href"); a.setAttribute("aria-disabled","true"); a.classList.add("disabled"); }
+    if (DEMO || /^local-/.test(p.id)) {
+      a.textContent="Reserva disponible al conectar el backend";
+      a.removeAttribute("href"); a.setAttribute("aria-disabled","true"); a.classList.add("disabled");
+    }
+    var ph=$("#d-photo");
+    if(ph && p.foto_path) { var u=profileUrl(p.foto_path), im=h("img"); im.src=u; im.alt=p.nombre; im.onerror=function(){ im.remove(); ph.classList.remove("has-img"); }; ph.classList.add("has-img"); ph.appendChild(im); }
+    var dir=$("#d-lugar");
+    if(dir && p.direccion) {
+      dir.hidden=false; $("#d-direccion").textContent=p.direccion + (p.zona ? " · " + p.zona : "");
+      $("#d-mapa").href="https://www.google.com/maps/search/?api=1&query="+encodeURIComponent(p.direccion+", "+(p.zona||"")+", Bogotá, Colombia");
+    }
+    var con=$("#d-contacto");
+    if(con && p.telefono) {
+      var digits=String(p.telefono).replace(/\D/g,""); if(digits.length===10) digits="57"+digits;
+      con.hidden=false; var tel=$("#d-tel"); tel.textContent=p.telefono; tel.href="tel:"+p.telefono.replace(/[^\d+]/g,"");
+      $("#d-wa").href="https://wa.me/"+digits+"?text="+encodeURIComponent("Hola, vi tu servicio en PetGo y quisiera más información.");
+    }
+    if(p.business_id && !DEMO) {
+      D.team(p.business_id, p.id).then(function(r){
+        if(r.error || !r.data || !r.data.length) return;
+        var box=$("#d-equipo-lista"); if(!box) return; box.innerHTML="";
+        r.data.forEach(function(w){
+          var c=h("div","team-card"), av=h("span","avatar",(w.nombre||"?").charAt(0).toUpperCase()), t=h("div");
+          if(w.foto_path) paintPhoto(av, profileUrl(w.foto_path), w.nombre);
+          add(t,h("b",null,w.nombre),h("small",null,w.funcion||""));
+          if(w.descripcion) add(t,h("small",null,w.descripcion));
+          add(c,av,t); box.appendChild(c);
+        });
+        $("#d-equipo").hidden=false;
+      });
+    }
   }
 
   /* ================= Reserva: inicio y mascota ================= */
@@ -352,26 +621,56 @@
     var bk0 = getBooking();
     var back = $("#back-fecha");
     if (back && bk0.reprogramar) back.setAttribute("href", "detalle-de-reserva.html?id=" + encodeURIComponent(bk0.reprogramar));
-    var proId = bk0.profesionalId || "happy-walk";
+    var proId = bk0.profesionalId || "";
+    var pro = getPro(proId);
+    if (!pro) { location.replace("servicios.html"); return; }
+    var DIAS_CORTO = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
+    function trabaja(dow) { return !pro.dias || pro.dias.indexOf(dow) !== -1; }
+    function minutos(t) { var p = String(t).split(":"); return (+p[0]) * 60 + (+p[1]); }
+    // Horas de inicio posibles ese día: cada 60 min desde que abre, mientras la sesión termine antes de cerrar
+    function horasDelDia() {
+      var ini = pro.hora_inicio ? minutos(pro.hora_inicio) : 7 * 60, fin = pro.hora_fin ? minutos(pro.hora_fin) : 20 * 60, out = [];
+      for (var t = ini; t + (+pro.duracion_min || 30) <= fin && t <= 19 * 60; t += 60) out.push(t);
+      return out;
+    }
+    function etiqueta(t) { var H = Math.floor(t / 60), M = t % 60; return ((H % 12) || 12) + ":" + pad(M) + " " + (H >= 12 ? "PM" : "AM"); }
 
     var today = new Date(); today.setHours(0, 0, 0, 0);
     var months = [0, 1, 2].map(function (i) { var d = new Date(today.getFullYear(), today.getMonth() + i, 1); return { y: d.getFullYear(), m: d.getMonth() }; });
     var idx = 0, selected = null;
-    var preSel = $(".slot.sel[data-hora]");
-    var hora = preSel ? preSel.dataset.hora : null;
+    var hora = null;
     var title = $(".mt", calRoot), prev = $("#cal-prev"), nextBtn = $("#cal-next");
     var days = $(".cal-days", calRoot), selTxt = $("#cal-sel-text");
-    var slots = $$(".slot[data-hora]");
+    var slots = [];
+    var grid = $("#slot-grid"), note = $("#slot-note");
+    if (note && pro.horario) note.textContent = "Horario de atención: " + pro.horario + ". Elige una fecha para ver las horas; las tachadas ya están ocupadas.";
     var reqId = 0;
+
+    function buildSlots() {
+      grid.innerHTML = ""; slots = []; hora = null;
+      if (!selected) return;
+      var dow = new Date(selected.y, selected.m, selected.d).getDay();
+      var horas = trabaja(dow) ? horasDelDia() : [];
+      if (!horas.length) { grid.appendChild(h("p", "slot-empty", "Este profesional no atiende ese día. Elige otra fecha.")); return; }
+      horas.forEach(function (t) {
+        var b = h("button", "slot", etiqueta(t)); b.type = "button"; b.dataset.hora = etiqueta(t);
+        b.addEventListener("click", function () {
+          if (b.disabled) return;
+          slots.forEach(function (x) { x.classList.remove("sel"); });
+          b.classList.add("sel"); hora = b.dataset.hora; selTxt.classList.remove("warn");
+        });
+        grid.appendChild(b); slots.push(b);
+      });
+    }
 
     function fechaStr(s) { return s.d + " de " + MESES[s.m] + " de " + s.y; }
     function fechaIso(s) { return s.y + "-" + pad(s.m + 1) + "-" + pad(s.d); }
 
     async function refreshSlots() {
       var my = ++reqId;
-      slots.forEach(function (s) { if (s.classList.contains("dyn")) { s.classList.remove("off", "dyn"); s.disabled = false; } });
-      if (!selected) return;
-      var r = await sb.rpc("slots_ocupados", { p_professional: proId, p_fecha: fechaIso(selected) });
+      buildSlots();
+      if (!selected || !slots.length) return;
+      var r = await D.slots(proId, fechaIso(selected));
       if (my !== reqId || r.error) return;
       var ocupadas = (r.data || []).map(function (t) { return String(t).slice(0, 5); });
       // si estamos reprogramando, la propia reserva no cuenta como ocupada
@@ -396,7 +695,7 @@
       var i, d;
       for (i = 0; i < first; i++) days.appendChild(document.createElement("div"));
       for (d = 1; d <= total; d++) {
-        var disabled = new Date(cur.y, cur.m, d) < today;
+        var disabled = new Date(cur.y, cur.m, d) < today || !trabaja(new Date(cur.y, cur.m, d).getDay());
         var el = document.createElement(disabled ? "div" : "button");
         el.textContent = d;
         if (disabled) {
@@ -420,16 +719,6 @@
     prev.addEventListener("click", function () { if (idx > 0) { idx--; render(); } });
     nextBtn.addEventListener("click", function () { if (idx < months.length - 1) { idx++; render(); } });
     render();
-
-    slots.forEach(function (s) {
-      s.addEventListener("click", function () {
-        if (s.disabled) return;
-        slots.forEach(function (x) { x.classList.remove("sel"); });
-        s.classList.add("sel");
-        hora = s.dataset.hora;
-        selTxt.classList.remove("warn");
-      });
-    });
 
     $("#cal-ok").addEventListener("click", function (e) {
       if (!selected || !hora) {
@@ -459,23 +748,22 @@
         confirmBtn.classList.add("disabled");
         var res, r;
         if (rid && (r = getRes(rid))) {
-          res = await sb.from("bookings").update({ fecha: fecha, hora: hr }).eq("id", rid).select("id").single();
+          res = await D.bookings.update(rid, { fecha: fecha, hora: hr });
         } else {
-          var pro = getPro(b.profesionalId || "happy-walk");
+          var pro = getPro(b.profesionalId);
           if (!pro) { confirmBtn.classList.remove("disabled"); fail("Elige primero un profesional."); return; }
           var pet = petByName(v.mascota);
-          res = await sb.from("bookings").insert({
-            professional_id: pro.id, pet_id: pet ? pet.id : null, pet_nombre: v.mascota,
-            fecha: fecha, hora: hr, servicio: v.servicio, precio: pro.precio, duracion_min: pro.duracion_min
-          }).select("id").single();
+          res = await D.bookings.create({ professional_id: pro.id, pet_id: pet ? pet.id : null, pet_nombre: v.mascota, fecha: fecha, hora: hr });
         }
         confirmBtn.classList.remove("disabled");
         if (res.error) {
-          var m = (res.error.message || "") + " " + (res.error.code || "");
-          if (/23505|duplicate|bookings_slot_unico/i.test(m)) { location.href = "estado-horario-ocupado.html"; return; }
-          if (/LIMITE_RESERVAS/.test(m)) { location.href = "estado-limite-de-reservas.html"; return; }
-          if (/FECHA_PASADA/.test(m)) { fail("Esa fecha ya pasó. Elige otra."); return; }
-          fail("No se pudo guardar la reserva. Intenta de nuevo.", res.error);
+          var code = res.error.code;
+          if (code === "horario_ocupado") { location.href = "estado-horario-ocupado.html"; return; }
+          if (code === "limite_reservas") { location.href = "estado-limite-de-reservas.html"; return; }
+          if (code === "fecha_pasada") { fail("Esa fecha ya pasó. Elige otra."); return; }
+          if (code === "fuera_de_horario") { fail("Ese día u hora está fuera del horario de atención del profesional. Elige otro horario."); return; }
+          if (code === "reserva_cancelada") { fail("Esa reserva ya está cancelada."); return; }
+          fail(code === "sin_conexion" ? res.error.message : "No se pudo guardar la reserva. Intenta de nuevo.", res.error);
           return;
         }
         setBooking({ ultima: res.data.id, reprogramar: null });
@@ -552,6 +840,7 @@
       return;
     }
     $$("[data-res]").forEach(function (el) { if (res[el.dataset.res]) el.textContent = res[el.dataset.res]; });
+    $$("[data-row]").forEach(function (row) { row.hidden = !res[row.dataset.row]; });
     var cancelled = res.estado === "cancelada" || resBadge.dataset.force === "cancelada";
     resBadge.className = "badge " + (cancelled ? "cancel" : "next");
     resBadge.textContent = cancelled ? "Cancelada" : "Próxima";
@@ -566,7 +855,7 @@
       e.preventDefault();
       if (res.estado === "confirmada") {
         dc.classList.add("disabled");
-        var r = await sb.from("bookings").update({ estado: "cancelada" }).eq("id", res.id);
+        var r = await D.bookings.cancel(res.id);
         dc.classList.remove("disabled");
         if (r.error) { fail("No se pudo cancelar la reserva. Intenta de nuevo.", r.error); return; }
       }
@@ -597,7 +886,7 @@
         add(b, h("span", "icon-box s", "🔔"), tx, dot);
         b.addEventListener("click", async function () {
           if (n.leida) return;
-          var r = await sb.from("notifications").update({ leida: true }).eq("id", n.id);
+          var r = await D.notifs.read(n.id);
           if (r.error) { fail("No se pudo actualizar la notificación.", r.error); return; }
           n.leida = true; render(); refreshNav();
         });
@@ -610,7 +899,7 @@
     render();
     var markAll = $("#mark-all");
     if (markAll) markAll.addEventListener("click", async function () {
-      var r = await sb.from("notifications").update({ leida: true }).eq("leida", false);
+      var r = await D.notifs.readAll();
       if (r.error) { fail("No se pudieron marcar como leídas.", r.error); return; }
       S.notifs.forEach(function (n) { n.leida = true; });
       render(); refreshNav();
@@ -619,43 +908,50 @@
 
   /* ================= Mis mascotas ================= */
   function setupMascotas() {
-    var petForm = $("#pet-form");
-    if (!petForm) return;
-    var list = $("#pet-list");
-    var fNombre = $("#f-nombre"), fNombreWrap = fNombre.closest(".field");
-    var fEsp = $("#f-especie"), fRaza = $("#f-raza"), fEdad = $("#f-edad");
-    var fFoto = $("#f-foto"), fotoTx = $("#foto-tx"), fotoBlob = null, saving = false;
+    var form = $("#pet-form");
+    if (!form) return;
+    var list = $("#pet-list"), count = $("#pet-count");
+    var fNombre = $("#f-nombre"), fEsp = $("#f-especie"), fRaza = $("#f-raza"), fEdad = $("#f-edad"), fDesc = $("#f-desc");
+    var fFoto = $("#f-foto"), fotoTx = $("#foto-tx"), delBtn = $("#btn-delete-pet"), saveBtn = $("#save-pet");
+    var current = null, fotoBlob = null, saving = false;
 
     function renderPets() {
       list.innerHTML = "";
-      if (!S.pets.length) list.appendChild(h("p", "hist-note", "Aún no tienes mascotas. Agrega la primera con el formulario."));
+      if (count) count.textContent = S.pets.length + (S.pets.length === 1 ? " perfil" : " perfiles");
+      if (!S.pets.length) list.appendChild(h("p", "hist-note", "Todavía no tienes mascotas. Pulsa Agregar para crear un perfil."));
       S.pets.forEach(function (p) {
-        var row = h("div", "pet-row"), card = h("div", "card"), dt = h("div", "dt");
-        add(dt, h("b", null, p.nombre), h("span", null, petSub(p)));
-        add(card, petIcon(p), dt);
-        var del = h("button", "btn danger sm js-del", "Eliminar"); del.type = "button";
-        del.addEventListener("click", async function () {
-          if (!confirm("¿Eliminar a " + p.nombre + "?")) return;
-          del.disabled = true;
-          var r = await sb.from("pets").delete().eq("id", p.id);
-          if (r.error) { del.disabled = false; fail("No se pudo eliminar la mascota.", r.error); return; }
-          if (p.path) sb.storage.from("pet-photos").remove([p.path]);
-          S.pets = S.pets.filter(function (x) { return x.id !== p.id; });
-          renderPets();
-        });
-        add(row, card, del);
+        var row = h("div", "pet-line"), info = h("div", "pet-line-info"), edit = h("button", "btn sec sm", "Editar");
+        edit.type = "button";
+        add(info, h("strong", null, p.nombre), h("span", null, (p.raza || p.especie || "Mascota") + " · " + (p.edad || "Edad no indicada") + " · " + (p.especie || "Perro")));
+        if (p.descripcion) add(info, h("small", null, p.descripcion));
+        edit.addEventListener("click", function () { openForm(p); });
+        add(row, petIcon(p), info, edit);
         list.appendChild(row);
       });
     }
+    function closeForm() {
+      form.hidden = true; current = null; fotoBlob = null; form.reset();
+      fotoTx.textContent = "Subir foto (opcional)";
+    }
+    function openForm(p) {
+      current = p || null; fotoBlob = null; form.hidden = false;
+      $("#pet-form-title").textContent = p ? "Editar a " + p.nombre : "Agregar mascota";
+      saveBtn.textContent = p ? "Guardar cambios" : "Guardar mascota";
+      delBtn.hidden = !p;
+      fNombre.value = p ? p.nombre : ""; fEsp.value = p ? (p.especie || "Perro") : "Perro";
+      fRaza.value = p ? (p.raza || "") : ""; fEdad.value = p ? (p.edad || "") : ""; fDesc.value = p ? (p.descripcion || "") : "";
+      fFoto.value = ""; fotoTx.textContent = p && p.foto ? "Cambiar foto" : "Subir foto (opcional)";
+      form.scrollIntoView({ behavior: "smooth", block: "center" });
+      fNombre.focus({ preventScroll: true });
+    }
     renderPets();
-
-    fNombre.addEventListener("input", function () { fNombreWrap.classList.remove("error"); });
 
     // La foto se reduce (máx. 640 px) antes de subirla.
     fFoto.addEventListener("change", function () {
       var f = fFoto.files && fFoto.files[0];
       fotoBlob = null;
-      if (!f) { fotoTx.textContent = "Subir foto"; return; }
+      if (!f) return;
+      if (!/^image\//.test(f.type)) { toast("Selecciona una imagen válida.", true); fFoto.value = ""; return; }
       fotoTx.textContent = f.name;
       var url = URL.createObjectURL(f), im = new Image();
       im.onload = function () {
@@ -666,22 +962,31 @@
         cv.toBlob(function (b) { fotoBlob = b; }, "image/jpeg", 0.85);
         URL.revokeObjectURL(url);
       };
-      im.onerror = function () { fotoTx.textContent = "Subir foto"; toast("No se pudo leer esa imagen.", true); };
+      im.onerror = function () { fotoTx.textContent = "Subir foto (opcional)"; toast("No se pudo leer esa imagen.", true); };
       im.src = url;
     });
 
-    $("#btn-add").addEventListener("click", function (e) {
-      e.preventDefault();
-      fNombre.scrollIntoView({ behavior: "smooth", block: "center" });
-      fNombre.focus({ preventScroll: true });
+    $("#btn-add").addEventListener("click", function (e) { e.preventDefault(); openForm(null); });
+    $("#cancel-pet").addEventListener("click", function (e) { e.preventDefault(); closeForm(); });
+
+    delBtn.addEventListener("click", async function () {
+      if (!current || !confirm("¿Eliminar a " + current.nombre + "?")) return;
+      delBtn.disabled = true;
+      var r = await D.pets.remove(current.id);
+      delBtn.disabled = false;
+      if (r.error) { fail("No se pudo eliminar la mascota.", r.error); return; }
+      if (current.path) sb.storage.from("pet-photos").remove([current.path]);
+      var id = current.id;
+      S.pets = S.pets.filter(function (x) { return x.id !== id; });
+      closeForm(); renderPets();
     });
 
     async function savePet() {
       if (saving) return;
-      var nombre = fNombre.value.trim();
-      if (!nombre) { fNombreWrap.classList.add("error"); fNombre.focus(); return; }
-      saving = true;
-      var btn = $("#save-pet"); btn.classList.add("disabled");
+      var nombre = fNombre.value.trim(), edad = fEdad.value.trim();
+      if (!nombre) { toast("Escribe el nombre de la mascota.", true); fNombre.focus(); return; }
+      if (edad && !/^\d{1,2}(\s*años?)?$/i.test(edad)) { toast("Indica la edad en años, por ejemplo 3.", true); fEdad.focus(); return; }
+      saving = true; saveBtn.classList.add("disabled");
       try {
         var path = null;
         if (fotoBlob) {
@@ -690,15 +995,29 @@
           if (up.error) { fail("No se pudo subir la foto.", up.error); path = null; }
         }
         var esp = fEsp.value.trim() || "Perro";
-        var r = await sb.from("pets").insert({ nombre: nombre, especie: esp, raza: fRaza.value.trim() || esp, edad: fEdad.value.trim() || null, foto_path: path }).select("*").single();
-        if (r.error) { fail("No se pudo guardar la mascota.", r.error); return; }
-        S.pets.push(mapPet(r.data));
-        fNombre.value = ""; fEsp.value = ""; fRaza.value = ""; fEdad.value = ""; fFoto.value = ""; fotoBlob = null; fotoTx.textContent = "Subir foto";
-        renderPets();
-      } finally { saving = false; btn.classList.remove("disabled"); }
+        var data = { nombre: nombre, especie: esp, raza: fRaza.value.trim() || esp, edad: edad || null, descripcion: fDesc.value.trim() };
+        var r;
+        if (current) {
+          if (path) data.foto_path = path;
+          r = await D.pets.update(current.id, data);
+        } else {
+          data.foto_path = path;
+          r = await D.pets.create(data);
+        }
+        if (r.error) {
+          if (path) sb.storage.from("pet-photos").remove([path]);
+          fail("No se pudo guardar la mascota.", r.error); return;
+        }
+        var saved = mapPet(r.data);
+        if (current) {
+          if (path && current.path) sb.storage.from("pet-photos").remove([current.path]);   // se descarta la foto anterior
+          S.pets = S.pets.map(function (x) { return x.id === saved.id ? saved : x; });
+        } else S.pets.push(saved);
+        closeForm(); renderPets();
+      } finally { saving = false; saveBtn.classList.remove("disabled"); }
     }
-    petForm.addEventListener("submit", function (e) { e.preventDefault(); savePet(); });
-    $("#save-pet").addEventListener("click", function (e) { e.preventDefault(); savePet(); });
+    form.addEventListener("submit", function (e) { e.preventDefault(); savePet(); });
+    saveBtn.addEventListener("click", function (e) { e.preventDefault(); savePet(); });
   }
 
   /* ================= Dashboard ================= */
@@ -741,285 +1060,96 @@
     var K = ["nombre", "correo", "telefono", "ciudad"];
     var P = { nombre: $("#p-nombre"), correo: $("#p-correo"), telefono: $("#p-tel"), ciudad: $("#p-ciudad") };
     var V = { nombre: $("#v-nombre"), correo: $("#v-correo"), telefono: $("#v-tel"), ciudad: $("#v-ciudad") };
+    var fotoNueva = null, quitarFoto = false, vistaPrevia = null;
+    var fIn = $("#p-foto"), fPrev = $("#p-foto-prev"), fDel = $("#p-foto-quitar");
+    function paintFoto() {
+      var ini = (S.perfil.nombre || "A").charAt(0).toUpperCase();
+      [$("#v-inicial"), fPrev].forEach(function (el) {
+        if (!el) return;
+        el.classList.remove("has-img"); el.textContent = ini;
+        var url = vistaPrevia || (!quitarFoto && S.perfil.foto) || "";
+        if (url) paintPhoto(el, url, S.perfil.nombre);
+      });
+      if (fDel) fDel.hidden = !(vistaPrevia || (!quitarFoto && S.perfil.fotoPath));
+    }
     function paint() {
       K.forEach(function (k) { V[k].textContent = S.perfil[k] || "—"; P[k].value = S.perfil[k] || ""; });
-      $("#v-inicial").textContent = (S.perfil.nombre || "A").charAt(0).toUpperCase();
+      paintFoto();
     }
     paint();
+    if (fIn) fIn.addEventListener("change", function () {
+      var f = fIn.files && fIn.files[0]; if (!f) return;
+      if (!/^image\//.test(f.type)) { toast("Selecciona una imagen válida.", true); fIn.value = ""; return; }
+      if (vistaPrevia) URL.revokeObjectURL(vistaPrevia);
+      fotoNueva = f; quitarFoto = false; vistaPrevia = URL.createObjectURL(f); paintFoto();
+    });
+    if (fDel) fDel.addEventListener("click", function () {
+      if (vistaPrevia) URL.revokeObjectURL(vistaPrevia);
+      fotoNueva = null; vistaPrevia = null; quitarFoto = true; if (fIn) fIn.value = ""; paintFoto();
+    });
+    function resetFoto() { if (vistaPrevia) URL.revokeObjectURL(vistaPrevia); fotoNueva = null; vistaPrevia = null; quitarFoto = false; if (fIn) fIn.value = ""; }
     P.correo.readOnly = true;   // el correo es el de la cuenta; cambiarlo requiere verificación
     function open() { card.classList.add("open"); editRow.hidden = true; flash.classList.remove("show"); }
     function close() { card.classList.remove("open"); editRow.hidden = false; }
     editRow.addEventListener("click", open);
-    $("#edit-cancel").addEventListener("click", function () { paint(); close(); });
+    $("#edit-cancel").addEventListener("click", function () { resetFoto(); paint(); close(); });
     $("#edit-save").addEventListener("click", async function () {
       var patch = { nombre: P.nombre.value.trim() || S.perfil.nombre, telefono: P.telefono.value.trim(), ciudad: P.ciudad.value.trim() || S.perfil.ciudad };
-      var r = await sb.from("profiles").update(patch).eq("id", S.uid);
-      if (r.error) { fail("No se pudieron guardar los cambios.", r.error); return; }
+      var viejo = S.perfil.fotoPath, nuevoPath = null;
+      try {
+        if (fotoNueva) { nuevoPath = await uploadProfilePhoto(fotoNueva); patch.foto_path = nuevoPath; }
+        else if (quitarFoto) patch.foto_path = null;
+      } catch (er) { fail("No se pudo subir la foto.", er); return; }
+      var r = await D.me.update(patch);
+      if (r.error) { removeProfilePhoto(nuevoPath); fail("No se pudieron guardar los cambios.", r.error); return; }
       S.perfil.nombre = patch.nombre; S.perfil.telefono = patch.telefono; S.perfil.ciudad = patch.ciudad;
-      paint(); refreshNav(); close(); flash.classList.add("show");
+      if ("foto_path" in patch) { S.perfil.fotoPath = patch.foto_path; S.perfil.foto = profileUrl(patch.foto_path); if (viejo) removeProfilePhoto(viejo); }
+      resetFoto(); paint(); refreshNav(); close(); flash.classList.add("show");
     });
     var out = $("#btn-logout");
     if (out) out.addEventListener("click", async function (e) {
       e.preventDefault();
       try { sessionStorage.removeItem(BK_KEY); } catch (er) { /* ignorar */ }
+      clearNavCache();
       await sb.auth.signOut();
       location.href = "index.html";
     });
   }
 
-  /* ================= Accesibilidad (zoom, contraste, lectura en voz alta) ================= */
-  var A11Y_KEY = "petgo_a11y";
-  var A11Y_ZOOMS = [0.9, 1, 1.15, 1.3, 1.5];
-  var a11yState = { zoom: 1, contrast: false };
-  var a11ySpeaking = false;
-
-  function loadA11y() {
+  /* ================= Destino según el tipo de cuenta ================= */
+  async function homeFor() {
     try {
-      var raw = localStorage.getItem(A11Y_KEY);
-      if (raw) {
-        var o = JSON.parse(raw);
-        if (typeof o.zoom === "number") a11yState.zoom = o.zoom;
-        if (typeof o.contrast === "boolean") a11yState.contrast = o.contrast;
-      }
-    } catch (e) { /* ignorar */ }
+      var me = await D.me.get();
+      if (me.data && me.data.rol === "proveedor") return "proveedor-panel.html";
+    } catch (e) { /* si falla, se va al panel de dueño */ }
+    return "dashboard.html";
   }
-  function saveA11y() {
-    try { localStorage.setItem(A11Y_KEY, JSON.stringify(a11yState)); } catch (e) { /* ignorar */ }
-  }
-  function applyA11y() {
-    document.documentElement.style.setProperty("--a11y-zoom", String(a11yState.zoom));
-    document.documentElement.classList.toggle("a11y-contrast", !!a11yState.contrast);
-    // zoom activo solo cuando no es 1 (para no interferir con layout base)
-    document.body.classList.toggle("a11y-zoom-active", a11yState.zoom !== 1);
-    var levelEl = document.getElementById("a11y-zoom-level");
-    if (levelEl) levelEl.textContent = Math.round(a11yState.zoom * 100) + "%";
-    var sw = document.getElementById("a11y-contrast-sw");
-    if (sw) sw.classList.toggle("on", !!a11yState.contrast);
-  }
-  function setZoom(delta) {
-    var i = A11Y_ZOOMS.indexOf(a11yState.zoom);
-    if (i < 0) i = 1;
-    i = Math.max(0, Math.min(A11Y_ZOOMS.length - 1, i + delta));
-    a11yState.zoom = A11Y_ZOOMS[i];
-    saveA11y();
-    applyA11y();
-  }
-  function toggleContrast() {
-    a11yState.contrast = !a11yState.contrast;
-    saveA11y();
-    applyA11y();
-  }
-  function getPageText() {
-    var main = document.querySelector("main") || document.body;
-    var clone = main.cloneNode(true);
-    // quitar scripts, estilos y el propio panel
-    var remove = clone.querySelectorAll("script, style, #a11y-root, noscript");
-    for (var i = 0; i < remove.length; i++) remove[i].remove();
-    var text = (clone.innerText || clone.textContent || "").replace(/\s+/g, " ").trim();
-    return text.slice(0, 8000); // límite razonable
-  }
-  function stopSpeech() {
-    if (window.speechSynthesis) speechSynthesis.cancel();
-    a11ySpeaking = false;
-    var btn = document.getElementById("a11y-speak");
-    if (btn) btn.textContent = "Leer página";
-  }
-  function toggleSpeech() {
-    if (!window.speechSynthesis) {
-      toast("Tu navegador no soporta lectura en voz alta.", true);
-      return;
+
+  /* ================= Panel de proveedores (lo dibuja petgo-extra.js) ================= */
+  var readyResolve;
+  window.PetGo = {
+    profileUrl: profileUrl, uploadPhoto: uploadProfilePhoto, removePhoto: removeProfilePhoto, paintPhoto: paintPhoto,
+    ready: new Promise(function (res) { readyResolve = res; }),
+    logout: async function () {
+      try { sessionStorage.removeItem(BK_KEY); sessionStorage.removeItem("petgo_preview"); } catch (er) { /* ignorar */ }
+      clearNavCache();
+      try { if (sb) await sb.auth.signOut(); } catch (er) { console.warn("No fue posible cerrar la sesión:", er); }
+      location.href = "login.html";
     }
-    if (a11ySpeaking) {
-      stopSpeech();
-      return;
-    }
-    var text = getPageText();
-    if (!text) {
-      toast("No hay texto para leer.", true);
-      return;
-    }
-    stopSpeech();
-    var u = new SpeechSynthesisUtterance(text);
-    u.lang = "es-ES";
-    u.rate = 1;
-    u.onend = function () { a11ySpeaking = false; var b = document.getElementById("a11y-speak"); if (b) b.textContent = "Leer página"; };
-    u.onerror = function () { a11ySpeaking = false; var b = document.getElementById("a11y-speak"); if (b) b.textContent = "Leer página"; };
-    a11ySpeaking = true;
-    var btn = document.getElementById("a11y-speak");
-    if (btn) btn.textContent = "Detener";
-    speechSynthesis.speak(u);
-  }
-  function setupAccesibilidad() {
-    if (document.getElementById("a11y-root")) return;
-    loadA11y();
-    applyA11y();
-
-    var root = h("div");
-    root.id = "a11y-root";
-    root.setAttribute("aria-label", "Herramientas de accesibilidad");
-
-    var toggle = h("button");
-    toggle.id = "a11y-toggle";
-    toggle.type = "button";
-    toggle.setAttribute("aria-expanded", "false");
-    toggle.setAttribute("aria-controls", "a11y-panel");
-    toggle.title = "Accesibilidad";
-    toggle.innerHTML = "♿";
-    toggle.addEventListener("click", function () {
-      var panel = document.getElementById("a11y-panel");
-      var open = panel.classList.toggle("open");
-      toggle.setAttribute("aria-expanded", open ? "true" : "false");
-    });
-
-    var panel = h("div");
-    panel.id = "a11y-panel";
-    panel.setAttribute("role", "dialog");
-    panel.setAttribute("aria-label", "Opciones de accesibilidad");
-
-    var title = h("h3", null, "Accesibilidad");
-    panel.appendChild(title);
-
-    // Zoom
-    var rowZ = h("div", "a11y-row");
-    rowZ.appendChild(h("span", "a11y-label", "Tamaño del texto"));
-    var ctrZ = h("div", "a11y-controls");
-    var btnMinus = h("button", "a11y-btn", "A−");
-    btnMinus.type = "button";
-    btnMinus.title = "Reducir texto";
-    btnMinus.setAttribute("aria-label", "Reducir tamaño del texto");
-    btnMinus.addEventListener("click", function () { setZoom(-1); });
-    var level = h("span", "a11y-level");
-    level.id = "a11y-zoom-level";
-    level.textContent = Math.round(a11yState.zoom * 100) + "%";
-    var btnPlus = h("button", "a11y-btn", "A+");
-    btnPlus.type = "button";
-    btnPlus.title = "Aumentar texto";
-    btnPlus.setAttribute("aria-label", "Aumentar tamaño del texto");
-    btnPlus.addEventListener("click", function () { setZoom(1); });
-    add(ctrZ, btnMinus, level, btnPlus);
-    rowZ.appendChild(ctrZ);
-    panel.appendChild(rowZ);
-    var hint = h("div", "a11y-hint", "Solo afecta al contenido, no a este panel");
-    panel.appendChild(hint);
-
-    // Contraste
-    var rowC = h("div", "a11y-row");
-    rowC.appendChild(h("span", "a11y-label", "Alto contraste"));
-    var sw = h("button", "a11y-switch");
-    sw.id = "a11y-contrast-sw";
-    sw.type = "button";
-    sw.setAttribute("role", "switch");
-    sw.setAttribute("aria-checked", a11yState.contrast ? "true" : "false");
-    sw.setAttribute("aria-label", "Activar alto contraste");
-    if (a11yState.contrast) sw.classList.add("on");
-    sw.addEventListener("click", function () {
-      toggleContrast();
-      sw.setAttribute("aria-checked", a11yState.contrast ? "true" : "false");
-    });
-    rowC.appendChild(sw);
-    panel.appendChild(rowC);
-
-    // Lectura en voz alta
-    var rowS = h("div", "a11y-row");
-    rowS.appendChild(h("span", "a11y-label", "Lectura en voz alta"));
-    var btnSpeak = h("button", "a11y-btn", "Leer página");
-    btnSpeak.id = "a11y-speak";
-    btnSpeak.type = "button";
-    btnSpeak.setAttribute("aria-label", "Leer el contenido de la página en voz alta");
-    btnSpeak.addEventListener("click", toggleSpeech);
-    rowS.appendChild(btnSpeak);
-    panel.appendChild(rowS);
-
-    root.appendChild(panel);
-    root.appendChild(toggle);
-    document.body.appendChild(root);
-
-    // Cerrar panel al hacer clic fuera
-    document.addEventListener("click", function (e) {
-      if (!root.contains(e.target)) {
-        panel.classList.remove("open");
-        toggle.setAttribute("aria-expanded", "false");
-      }
-    });
-    // Escape cierra el panel
-    document.addEventListener("keydown", function (e) {
-      if (e.key === "Escape" && panel.classList.contains("open")) {
-        panel.classList.remove("open");
-        toggle.setAttribute("aria-expanded", "false");
-        toggle.focus();
-      }
-    });
-  }
-
-  /* ================= Menú hamburguesa (móvil) ================= */
-  function setupNavMenu() {
-    var bar = document.querySelector(".navbar-in");
-    var links = document.querySelector(".nav-links");
-    if (!bar || !links || document.getElementById("nav-toggle")) return;
-
-    var btn = document.createElement("button");
-    btn.id = "nav-toggle";
-    btn.className = "nav-toggle";
-    btn.type = "button";
-    btn.setAttribute("aria-label", "Abrir menú de navegación");
-    btn.setAttribute("aria-expanded", "false");
-    btn.setAttribute("aria-controls", "nav-links-menu");
-    btn.innerHTML = "<span></span><span></span><span></span>";
-    links.id = links.id || "nav-links-menu";
-
-    // Insertar el botón antes de las acciones (o al final del navbar-in)
-    var actions = bar.querySelector(".nav-actions") || bar.querySelector(".nav-public");
-    if (actions) bar.insertBefore(btn, actions);
-    else bar.appendChild(btn);
-
-    var overlay = document.createElement("div");
-    overlay.className = "nav-overlay";
-    overlay.id = "nav-overlay";
-    document.body.appendChild(overlay);
-
-    function close() {
-      links.classList.remove("open");
-      overlay.classList.remove("open");
-      btn.setAttribute("aria-expanded", "false");
-      btn.setAttribute("aria-label", "Abrir menú de navegación");
-      document.body.style.overflow = "";
-    }
-    function open() {
-      links.classList.add("open");
-      overlay.classList.add("open");
-      btn.setAttribute("aria-expanded", "true");
-      btn.setAttribute("aria-label", "Cerrar menú de navegación");
-      document.body.style.overflow = "hidden";
-    }
-    function toggle() {
-      if (links.classList.contains("open")) close();
-      else open();
-    }
-
-    btn.addEventListener("click", function (e) {
-      e.stopPropagation();
-      toggle();
-    });
-    overlay.addEventListener("click", close);
-    links.querySelectorAll("a").forEach(function (a) {
-      a.addEventListener("click", close);
-    });
-    document.addEventListener("keydown", function (e) {
-      if (e.key === "Escape") close();
-    });
-    window.addEventListener("resize", function () {
-      if (window.innerWidth > 900) close();
-    });
-  }
+  };
 
   /* ================= Arranque ================= */
   async function boot() {
-    setupAccesibilidad();
-    setupNavMenu();
     try {
+      if (DEMO && PAGE !== "registro" && PAGE !== "login" && PAGE !== "proveedor-panel") {
+        loadDemo();
+        renderResultados();renderDetalle();setupMascotas();setupDashboard();loadPhotos();
+        $$(".nav-actions .profile-pill .js-name").forEach(function(el){el.textContent="Vista previa";});
+        return;
+      }
       var publica = PUBLICAS.indexOf(PAGE) !== -1;
       if (!sb) {
-        if (!publica) { toast("No se pudo cargar Supabase. Revisa tu conexión.", true); }
+        if (!publica) { toast("No se pudo cargar Supabase. Revisa tu conexión.", true); readyResolve(null); }
         loadPhotos(); setupLogin(); setupRegistro(); setupOAuth();
         return;
       }
@@ -1028,16 +1158,23 @@
       // Páginas públicas
       if (publica) {
         // Con sesión abierta, el login y el registro llevan directo al panel
-        if (sess && (PAGE === "login" || PAGE === "registro") && !query("stay")) { location.replace("dashboard.html"); return; }
+        if (sess && (PAGE === "login" || PAGE === "registro") && !query("stay")) { S.uid = sess.user.id; location.replace(await homeFor()); return; }
         loadPhotos(); setupLogin(); setupRegistro(); setupOAuth();
         return;
       }
       // Páginas privadas
       if (!sess) {
+        clearNavCache();
+        if (PAGE === "proveedor-panel") readyResolve(null);
         location.replace("login.html?next=" + encodeURIComponent(PAGE + ".html" + location.search));
         return;
       }
       S.uid = sess.user.id; S.user = sess.user;
+      if (PAGE === "proveedor-panel") {
+        window.PetGo.D = D;
+        readyResolve({ D: D, toast: toast, uid: S.uid });
+        return;
+      }
       await loadAll();
 
       setupReservar();
